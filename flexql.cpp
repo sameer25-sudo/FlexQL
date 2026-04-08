@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
+#include <vector>
+#include <sstream>
 
 struct FlexQL {
     int sock;
@@ -37,14 +39,43 @@ int flexql_exec(FlexQL* db, const char* query,
 
     send(db->sock, query, strlen(query), 0);
 
-    char buffer[1024];
+    char buffer[4096];  // bigger buffer
     int len = recv(db->sock, buffer, sizeof(buffer)-1, 0);
+    if (len <= 0) return FLEXQL_ERROR;
+
     buffer[len] = '\0';
 
-    if (callback) {
-        char* row[1];
-        row[0] = buffer;
-        callback(arg, 1, row);
+    std::string response(buffer);
+
+    // handle ERROR / EMPTY directly
+    if (response == "ERROR\n") {
+        return FLEXQL_ERROR;
+    }
+    else if (response == "EMPTY\n") {
+        return FLEXQL_OK;
+    }
+
+    std::stringstream ss(response);
+    std::string line;
+
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+
+        std::vector<std::string> cols;
+        std::stringstream row_stream(line);
+        std::string cell;
+
+        while (std::getline(row_stream, cell, '|')) {
+            cols.push_back(cell);
+        }
+
+        // prepare char* array
+        std::vector<char*> ccols;
+        for (auto &c : cols)
+            ccols.push_back(const_cast<char*>(c.c_str()));
+
+        if (callback)
+            callback(arg, ccols.size(), ccols.data());
     }
 
     return FLEXQL_OK;

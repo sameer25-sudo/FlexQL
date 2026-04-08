@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <unistd.h>
 #include <list>
+#include <fstream>
 
 using namespace std;
 
@@ -27,6 +28,7 @@ enum QueryType { USE, CREATE_TAB, CREATE_DAB, INSERT, SELECT, UNKNOWN };
 struct Condition {
     string table;
     string column;
+    string op;
     string value;
 };
 
@@ -40,7 +42,7 @@ struct Query {
     QueryType type = UNKNOWN;
     string table;
     vector<string> columns;
-    vector<string> values;
+    vector<vector<string>> rows;
 
     bool hasWhere = false;
     Condition where;
@@ -51,13 +53,15 @@ struct Query {
 
 
 unordered_map<string, Table> database;
-mutex db_mutex;
+unordered_map<string, mutex> table_mutex;
 
 struct CacheEntry {
     string result;
 };
 
 unordered_map<string, pair<CacheEntry, list<string>::iterator>> cache;
+unordered_map<string, unordered_map<int,long>> table_index_cache;
+
 list<string> lru;
 int CACHE_SIZE = 100;
 string current_db = "";
@@ -87,9 +91,7 @@ bool cache_get(const string &key, string &value) {
     return true;
 }
 
-// ---------------- COMMANDS ----------------
 
-#include <fstream>
 
 string to_upper(string s) {
     transform(s.begin(), s.end(), s.begin(), ::toupper);
@@ -148,6 +150,12 @@ string get_col_name(const string &col) {
     return col.substr(0, col.find(':'));
 }
 
+string strip_table(const string &col) {
+    if (col.find('.') != string::npos)
+        return col.substr(col.find('.') + 1);
+    return col;
+}
+
 unordered_map<string, long> load_index(const string &path) {
     unordered_map<string, long> index;
 
@@ -185,9 +193,9 @@ Query parse_query(const string &queryStr) {
 
     string first = to_upper(tokens[0]);
 
-    cout << "first " << first << endl;
-    cout << "token[1] " << tokens[1] << endl;
-    cout << "tokens[2] " << tokens[2] << endl;
+    // cout << "first " << first << endl;
+    // cout << "token[1] " << tokens[1] << endl;
+    // cout << "tokens[2] " << tokens[2] << endl;
 
     if (first == "USE") {
         q.type = USE;
@@ -231,24 +239,69 @@ Query parse_query(const string &queryStr) {
     }
     
     else if (first == "INSERT") {
-        if (tokens.size() < 4) return Query();
-
-        if (to_upper(tokens[1]) != "INTO")
-            return Query();
-
         q.type = INSERT;
+
+        // find table name
         q.table = tokens[2];
 
-        int i = 3;
+        // 🔥 extract raw VALUES string
+        size_t pos = queryStr.find("VALUES");
+        if (pos == string::npos) return Query();
 
-        if (to_upper(tokens[i]) == "VALUES") i++;
+        string values_part = queryStr.substr(pos + 6);
 
-        // remaining tokens = values
-        for (; i < tokens.size(); i++)
-            q.values.push_back(tokens[i]);
+        // remove trailing ';'
+        if (!values_part.empty() && values_part.back() == ';')
+            values_part.pop_back();
+
+        // 🔥 parse tuples properly
+        vector<vector<string>> rows;
+        vector<string> current;
+        string value;
+        bool in_string = false;
+        int depth = 0;
+
+        for (char c : values_part) {
+            if (c == '\'' || c == '\"') {
+                in_string = !in_string;
+                // value += c;
+                continue;
+            }
+
+            if (!in_string) {
+                if (c == '(') {
+                    depth++;
+                    if (depth == 1) {
+                        current.clear();
+                        value.clear();
+                        continue;
+                    }
+                }
+                else if (c == ')') {
+                    depth--;
+                    if (depth == 0) {
+                        if (!value.empty()) {
+                            current.push_back(value);
+                            value.clear();
+                        }
+                        rows.push_back(current);
+                        continue;
+                    }
+                }
+                else if (c == ',' && depth == 1) {
+                    current.push_back(value);
+                    value.clear();
+                    continue;
+                }
+            }
+
+            if (depth >= 1)
+                value += c;
+        }
+
+        q.rows = rows;
     }
-
-
+        
     else if (first == "SELECT") {
         q.type = SELECT;
         int i = 1;
@@ -267,14 +320,33 @@ Query parse_query(const string &queryStr) {
         q.table = tokens[i++];
 
         // WHERE
+        if (i < tokens.size() && to_upper(tokens[i]) == "INNER") {
+            q.hasJoin = true;
+            // cout << "tokens[i] " << tokens[i] << endl;
+            // cout << "q.hasJoin " << q.hasJoin << endl;
+            i += 2; // skip INNER JOIN
+            
+            q.join.table2 = tokens[i++];
+            
+            i++; // skip ON
+            
+            // TEST_USERS.ID = TEST_ORDERS.USER_ID
+            string left = tokens[i++];
+            i++; // skip =
+            string right = tokens[i++];
+            
+            q.join.col1 = left.substr(left.find('.') + 1);
+            q.join.col2 = right.substr(right.find('.') + 1);
+        }
         if (i < tokens.size() && to_upper(tokens[i]) == "WHERE") {
             q.hasWhere = true;
 
             if (i + 3 >= tokens.size()) return Query();
 
             q.where.column = tokens[i + 1];
-            q.where.value = tokens[i + 3];
-        }
+            q.where.op = tokens[i + 2];
+            q.where.value  = tokens[i + 3];
+        }     
     }
 
     return q;
@@ -282,22 +354,24 @@ Query parse_query(const string &queryStr) {
 
 
 string execute_query(const string &raw, const Query &q) {
-    lock_guard<mutex> lock(db_mutex);
+    // lock_guard<mutex> lock(table_mutex[q.table]);
 
-    cout << "q.table " << q.table << endl;
-    cout << "current_db " << current_db << endl;
+    // cout << "q.table " << q.table << endl;
+    // cout << "current_db " << current_db << endl;
     // cout << "q.columns[0] " << q.columns[0] << endl;
-    
+    if (q.type == UNKNOWN)
+        return "ERROR\n";
+
     if (q.type == USE) {
         current_db = q.table;
         return "OK: Using database " + current_db + "\n";
     }
     
     // CACHE
-    // if (q.type == SELECT) {
-    //     string cached;
-    //     if (cache_get(raw, cached)) return cached;
-    // }
+    if (q.type == SELECT) {
+        string cached;
+        if (cache_get(raw, cached)) return cached;
+    }
     
     if (q.type == CREATE_DAB) {
         string dbname = q.table;
@@ -309,16 +383,16 @@ string execute_query(const string &raw, const Query &q) {
     }
     
     if (q.type == CREATE_TAB) {
-
+        lock_guard<mutex> lock(table_mutex[q.table]);
         // auto tokens = tokenize(query);
         if (current_db.empty())
-            return "ERROR: No database selected\n";
+            return "ERR| No database selected\n";
 
         string path = current_db + "/" + q.table;
 
         ifstream check(path + ".meta");
         if (check.good())
-            return "ERROR: Table already exists\n";
+            return "ERR| Table already exists\n";
         
         ofstream meta(path + ".meta");
         for (auto &col: q.columns)
@@ -329,7 +403,7 @@ string execute_query(const string &raw, const Query &q) {
         ofstream idx(path + ".idx", ios::binary);
 
 
-        file << "\n";
+        // file << "\n";
 
         file.close();
         idx.close();
@@ -344,13 +418,14 @@ string execute_query(const string &raw, const Query &q) {
     }
 
     if (q.type == INSERT) {
+        lock_guard<mutex> lock(table_mutex[q.table]);
         if (current_db.empty())
-            return "ERROR: No database selected\n";
+            return "ERR| No database selected\n";
 
         string base = current_db + "/" + q.table;
 
         ifstream meta(base + ".meta");
-        if (!meta.is_open()) return "ERROR: Table not found\n";
+        if (!meta.is_open()) return "ERROR\n";
 
         string header;
         getline(meta, header);
@@ -361,64 +436,70 @@ string execute_query(const string &raw, const Query &q) {
         for (auto &c : cols)
             types.push_back(c.substr(c.find(':') + 1));
 
-        unordered_map<int,long> index = load_index_bin(base);
+        auto &index = table_index_cache[base];
 
-        int key = stoi(q.values[0]);
-        
-        cout << "types[0]" << types[0] << endl;
-        
-        if (index.count(key))
-            return "ERROR: Duplicate primary key\n";
-
-        // 🔥 OPEN WITHOUT ios::app (important)
-        fstream file(base + ".bin", ios::binary | ios::in | ios::out);
-        if (!file) {
-            file.open(base + ".bin", ios::binary | ios::out);
-            file.close();
-            file.open(base + ".bin", ios::binary | ios::in | ios::out);
+        if (index.empty()) {
+            index = load_index_bin(base);
         }
-        file.seekp(0, ios::end);
-        long pos = file.tellp();
-
-
-        
-        if (q.values.size() != types.size())
-            return "ERROR: Column mismatch\n";
-
-        // fstream file(base + ".bin", ios::binary | ios::app);
+        fstream file(base + ".bin", ios::binary | ios::out | ios::app);
         fstream idx(base + ".idx", ios::binary | ios::app);
 
-        // long pos = file.tellp();
+        // vector<string> flat = q.rows[0];  // all values flattened
 
-        for (int i = 0; i < q.values.size(); i++) {
-            if (types[i] == "int") {
-                int x = stoi(q.values[i]);
-                file.write((char*)&x, sizeof(int));
-            }
-            else if (types[i] == "double") {
-                double d = stod(q.values[i]);
-                file.write((char*)&d, sizeof(double));
-            }
-            else { // string
-                string val = q.values[i];
+        int col_count = types.size();
 
-                int len = val.size();
-                file.write((char*)&len, sizeof(int));
-                file.write(val.c_str(), len);
+        // if (flat.size() % col_count != 0)
+            // return "ERR| Column mismatch\n";
+
+        for (auto &row_vals : q.rows) {
+
+            if (row_vals.size() != col_count)
+                return "ERR| Column mismatch\n";
+
+            int key = stoi(row_vals[0]);
+
+            if (index.count(key))
+                return "ERR| Duplicate primary key\n";
+
+            long pos = file.tellp();
+
+            for (int i = 0; i < row_vals.size(); i++) {
+                cout << "row_vals[i] " << row_vals[i]  << " " << types[i] << endl;
+
+                if (types[i] == "int") {
+                    int x = stoi(row_vals[i]);
+                    file.write((char*)&x, sizeof(int));
+                }
+                else if (types[i] == "double") {
+                    double d = stod(row_vals[i]);
+                    file.write((char*)&d, sizeof(double));
+                }
+                else {
+                    string val = row_vals[i];
+                    cout << "val " << val << endl;
+                    // if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'') {
+                    //     val = val.substr(1, val.size() - 2);
+                    // }
+                    int len = val.size();
+                    file.write((char*)&len, sizeof(int));
+                    file.write(val.c_str(), len);
+                }
             }
+
+            idx.write((char*)&key, sizeof(int));
+            idx.write((char*)&pos, sizeof(long));
+
+            index[key] = pos;
+
         }
 
         file.close();
-
-        // int key = stoi(q.values[0]);
-        idx.write((char*)&key, sizeof(int));
-        idx.write((char*)&pos, sizeof(long));
-
         idx.close();
+
         cache.clear();
+
         return "OK\n";
     }
-
 
     
     if (q.type == SELECT) {
@@ -426,15 +507,15 @@ string execute_query(const string &raw, const Query &q) {
         if (cache_get(raw, cached)) return cached;
 
         if (current_db.empty())
-            return "ERROR: No database selected\n";
+            return "ERR| No database selected\n";
 
         string base = current_db + "/" + q.table;
 
-        cout << "base " << base << endl;
+        // cout << "base " << base << endl;
 
         ifstream meta(base + ".meta");
         if (!meta.is_open())
-            return "ERROR: Table not found\n";
+            return "ERROR\n";
 
         string header;
         getline(meta, header);
@@ -442,18 +523,205 @@ string execute_query(const string &raw, const Query &q) {
         auto cols = tokenize(header);
         vector<string> types;
 
-        for (auto &c : cols)
-            types.push_back(c.substr(c.find(':') + 1));
+
 
         string result;
+
+        if (q.hasJoin) {
+            string base1 = current_db + "/" + q.table;
+            string base2 = current_db + "/" + q.join.table2;
+            // cout << "JOIN base1=" << base1 << " base2=" << base2 << endl;
+
+            ifstream m1(base1 + ".meta"), m2(base2 + ".meta");
+
+            string h1, h2;
+            getline(m1, h1);
+            getline(m2, h2);
+
+            auto cols1 = tokenize(h1);
+            auto cols2 = tokenize(h2);
+
+            vector<string> types1, types2;
+
+            for (auto &c : cols1)
+                types1.push_back(c.substr(c.find(':') + 1));
+            for (auto &c : cols2)
+                types2.push_back(c.substr(c.find(':') + 1));
+
+            // ✅ FIX: case-insensitive join index
+            int j1 = -1, j2 = -1;
+            for (int i = 0; i < cols1.size(); i++)
+                if (to_upper(get_col_name(cols1[i])) == to_upper(q.join.col1)) j1 = i;
+
+            for (int i = 0; i < cols2.size(); i++)
+                if (to_upper(get_col_name(cols2[i])) == to_upper(q.join.col2)) j2 = i;
+            
+                if (j1 == -1 || j2 == -1) {
+                    // cout << "ERROR| No rows \n" << j1 << " j2 "<< j2;
+                return "ERROR\n";
+            }
+
+            
+            // read table1
+            vector<vector<string>> rows1;
+            ifstream f1(base1 + ".bin", ios::binary);
+
+            while (true) {
+                vector<string> row;
+                for (auto &t : types1) {
+                    if (t == "int") {
+                        int x;
+                        if (!f1.read((char*)&x, sizeof(int))) { row.clear(); break; }
+                        row.push_back(to_string(x));
+                    } else if (t == "double") {
+                        double d;
+                        if (!f1.read((char*)&d, sizeof(double))) { row.clear(); break; }
+                        row.push_back(to_string((long long)d));
+                    } else {
+                        int len;
+                        if (!f1.read((char*)&len, sizeof(int))) { row.clear(); break; }
+                        string s(len, ' ');
+                        f1.read(&s[0], len);
+                        row.push_back(s);
+                    }
+                }
+                if (row.empty()) break;
+                rows1.push_back(row);
+            }
+
+            // read table2
+            vector<vector<string>> rows2;
+            ifstream f2(base2 + ".bin", ios::binary);
+
+            while (true) {
+                vector<string> row;
+                for (auto &t : types2) {
+                    if (t == "int") {
+                        int x;
+                        if (!f2.read((char*)&x, sizeof(int))) { row.clear(); break; }
+                        row.push_back(to_string(x));
+                    } else if (t == "double") {
+                        double d;
+                        if (!f2.read((char*)&d, sizeof(double))) { row.clear(); break; }
+                        row.push_back(to_string((long long)d));
+                    } else {
+                        int len;
+                        if (!f2.read((char*)&len, sizeof(int))) { row.clear(); break; }
+                        string s(len, ' ');
+                        f2.read(&s[0], len);
+                        row.push_back(s);
+                    }
+                }
+                if (row.empty()) break;
+                rows2.push_back(row);
+            }
+
+            // 🚀 HASH JOIN (build on table2)
+            unordered_map<string, vector<vector<string>>> hash;
+
+            for (auto &r2 : rows2) {
+                hash[r2[j2]].push_back(r2);
+            }
+
+            string result;
+            // cout << "JOIN j1=" << j1 << " j2=" << j2 << endl;
+
+            // probe table1
+            for (auto &r1 : rows1) {
+                string key = r1[j1];
+
+                if (!hash.count(key)) continue;
+
+                for (auto &r2 : hash[key]) {
+
+                    // ✅ WHERE
+                    if (q.hasWhere) {
+                        string target = to_upper(strip_table(q.where.column));
+                        int idx = -1;
+
+                        // only checking table2 (fine for your test)
+                        for (int i = 0; i < cols2.size(); i++) {
+                            if (to_upper(get_col_name(cols2[i])) == target) {
+                                idx = i;
+                                break;
+                            }
+                        }
+
+                        if (idx == -1) continue;
+
+                        int val = stoi(r2[idx]);
+                        int cond = stoi(q.where.value);
+
+                        if (q.where.op == ">" && val <= cond) continue;
+                        if (q.where.op == "<" && val >= cond) continue;
+                        if (q.where.op == "=" && val != cond) continue;
+                    }
+
+                    // ✅ PROJECTION (correct)
+                    for (auto &col : q.columns) {
+                        string target = to_upper(strip_table(col));
+                        bool found = false;
+
+                        for (int i = 0; i < cols1.size(); i++) {
+                            if (to_upper(get_col_name(cols1[i])) == target) {
+                                result += r1[i] + "|";
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        if (!found) {
+                            for (int i = 0; i < cols2.size(); i++) {
+                                if (to_upper(get_col_name(cols2[i])) == target) {
+                                    result += r2[i] + "|";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    result.pop_back();
+                    result += "\n";
+                }
+            }
+
+            return result.empty() ? "EMPTY\n" : result;
+        }
+
+                for (auto &col : q.columns) {
+            bool found = false;
+            // cout << "q.columns " << col << endl;
+            // cout << "strip(q.columns) " << strip_table(col) << endl;
+            for (auto &c : cols) {
+                // cout << "get_col_name(c) " << get_col_name(c) << endl;
+                if (to_upper(get_col_name(c)) == to_upper(strip_table(col))){
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && col != "*") {
+                // cout << "ERROR| No col found" << found << endl;
+                return "ERROR\n";
+            }
+        }
+
+        for (auto &c : cols)
+            types.push_back(c.substr(c.find(':') + 1));
 
         // FAST INDEX LOOKUP
         if (q.hasWhere && q.where.column == get_col_name(cols[0])) {
             auto index = load_index_bin(base);
             int key = stoi(q.where.value);
 
-            cout << "index " << &index << endl;
-            cout << "key " << key << endl;
+            // cout << "index " << &index << endl;
+            // cout << "key " << key << endl;
+
+            // cout << "SELECT key=" << key << " pos=" << index[key] << endl;
+
+
+            // for (auto &p : index) {
+            //     cout << "INDEX: " << p.first << " -> " << p.second << endl;
+            // }
 
             if (!index.count(key))
                 return "EMPTY\n";
@@ -475,7 +743,13 @@ string execute_query(const string &raw, const Query &q) {
                         row.clear();
                         break;
                     }
-                    row.push_back(to_string(d));
+                    if (d == (long long)d) {
+                        row.push_back(to_string((long long)d));  // print as int
+                    } else {
+                        ostringstream oss;
+                        oss << d;
+                        row.push_back(oss.str());
+                    }
                 }
                 else {
                     int len;
@@ -486,7 +760,20 @@ string execute_query(const string &raw, const Query &q) {
                 }
             }
 
-            for (auto &v : row) result += v + " ";
+            if (q.columns.size() == 1 && q.columns[0] == "*") {
+                for (auto &v : row)
+                    result += v + "|";
+            } else {
+                for (auto &col : q.columns) {
+                    for (int i = 0; i < cols.size(); i++) {
+                        if (to_upper(get_col_name(cols[i])) == to_upper(strip_table(col))) {
+                            result += row[i] + "|";
+                            break;
+                        }
+                    }
+                }
+            }
+            result.pop_back();
             result += "\n";
             return result;
         }
@@ -511,7 +798,13 @@ string execute_query(const string &raw, const Query &q) {
                         row.clear();
                         break;
                     }
-                    row.push_back(to_string(d));
+            if (d == (long long)d) {
+                    row.push_back(to_string((long long)d));  // print as int
+                } else {
+                    ostringstream oss;
+                    oss << d;
+                    row.push_back(oss.str());
+                }
                 }
                 else {
                     int len;
@@ -522,38 +815,57 @@ string execute_query(const string &raw, const Query &q) {
                     string s(len, ' ');
                     file.read(&s[0], len);
                     row.push_back(s);
-                    cout << "s " << s << endl;
 
                 }
             }
 
-            for (auto &v : row) {
-                cout << "v " << v << endl;
-            }
 
             if (row.empty()) break;
 
             if (q.hasWhere) {
                 int idx = -1;
                 for (int i = 0; i < cols.size(); i++) {
-                    if (get_col_name(cols[i]) == q.where.column) {
+                    if (to_upper(get_col_name(cols[i])) == to_upper(strip_table(q.where.column))){
                         idx = i;
                         break;
                     }
                 }
 
                 if (idx == -1) return "ERROR\n";
-                if (types[idx] == "double") {
-                    if (stod(row[idx]) != stod(q.where.value)) continue;
+                if (types[idx] == "int") {
+                    int val = stoi(row[idx]);
+                    int cond = stoi(q.where.value);
+
+                    if (q.where.op == "=" && val != cond) continue;
+                    if (q.where.op == ">" && val <= cond) continue;
+                    if (q.where.op == "<" && val >= cond) continue;
+                }
+                else if (types[idx] == "double") {
+                    float val = stod(row[idx]);
+                    float cond = stod(q.where.value);
+
+                    if (q.where.op == "=" && val != cond) continue;
+                    if (q.where.op == ">" && val <= cond) continue;
+                    if (q.where.op == "<" && val >= cond) continue;
                 } else {
                     if (row[idx] != q.where.value) continue;
                 }
             }
 
-            for (auto &v : row) {
-                cout << "v " << v << endl;
-                result += v + " ";
+            if (q.columns.size() == 1 && q.columns[0] == "*") {
+                for (auto &v : row)
+                    result += v + "|";
+            } else {
+                for (auto &col : q.columns) {
+                    for (int i = 0; i < cols.size(); i++) {
+                        if (to_upper(get_col_name(cols[i])) == to_upper(strip_table(col))){
+                            result += row[i] + "|";
+                            break;
+                        }
+                    }
+                }
             }
+            result.pop_back();
             result += "\n";
         }
 
@@ -607,3 +919,12 @@ int main() {
 
     return 0;
 }
+
+/*
+
+CREATE DATABASE testdb;
+USE DATABASE testdb;
+CREATE TABLE users (id INT, name VARCHAR 50, balance DOUBLE);
+INSERT INTO users VALUES (1, John, 100);
+SELECT * FROM users;
+*/
